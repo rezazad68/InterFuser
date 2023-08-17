@@ -13,11 +13,19 @@ from collections import OrderedDict
 from .registry import register_model
 from .resnet import resnet26d, resnet50d, resnet18d, resnet26, resnet50, resnet101d
 from .layers import StdConv2dSame, StdConv2d, to_2tuple
+from .efficinet_dtransformer import DAEFormer
 
 _logger = logging.getLogger(__name__)
 
 
 class HybridEmbed(nn.Module):
+    """
+    Here we first apply the encoder modeule to extract the feature represenation for the input image.
+    If the feature size is not know we use a random data to get the feature size and we always use the last layer features
+    once we get the features we then apply a 1*1 convolution to reduce the feature dimension to the embeded dimension.
+    We also use average operation to extract the global information for this view. 
+    the output of this modue would be the tokenized sequence and the global toekn.
+    """
     def __init__(
         self,
         backbone,
@@ -497,8 +505,12 @@ class TransformerDecoderLayer(nn.Module):
         tgt2 = self.self_attn(
             q, k, value=tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
         )[0]
+        # print(f'q,k shape is: {q.size()} and value shape is {tgt.size()}')
+        
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
+        # print(f' memory shape is >> {memory.size()} and query shape is: {tgt.size()}')
+        # print(f'self.with_pos_embed(memory, pos) shape is:{self.with_pos_embed(memory, pos).size()}')
         tgt2 = self.multihead_attn(
             query=self.with_pos_embed(tgt, query_pos),
             key=self.with_pos_embed(memory, pos),
@@ -506,9 +518,11 @@ class TransformerDecoderLayer(nn.Module):
             attn_mask=memory_mask,
             key_padding_mask=memory_key_padding_mask,
         )[0]
+        # print(f'tgt2 shape is: {tgt2.size()}')
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        # print(f'tgt2 shape is: {tgt2.size()}')
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         return tgt
@@ -635,15 +649,17 @@ class Interfuser(nn.Module):
         act_layer=None,
         weight_init="",
         freeze_num=-1,
-        with_lidar=True,
+        with_lidar=False,
         with_right_left_sensors=True,
         with_center_sensor=True,
+        with_bov = True,
         traffic_pred_head_type="det",
         waypoints_pred_head="heatmap",
         reverse_pos=True,
         use_different_backbone=False,
         use_view_embed=True,
         use_mmad_pretrain=None,
+        transformer_encoder = 'simple',
     ):
         super().__init__()
         self.traffic_pred_head_type = traffic_pred_head_type
@@ -658,6 +674,7 @@ class Interfuser(nn.Module):
         self.with_lidar = with_lidar
         self.with_right_left_sensors = with_right_left_sensors
         self.with_center_sensor = with_center_sensor
+        self.with_bov = with_bov
 
         self.direct_concat = direct_concat
         self.separate_view_attention = separate_view_attention
@@ -772,8 +789,8 @@ class Interfuser(nn.Module):
                 embed_dim=embed_dim,
             )
 
-        self.global_embed = nn.Parameter(torch.zeros(1, embed_dim, 5))
-        self.view_embed = nn.Parameter(torch.zeros(1, embed_dim, 5, 1))
+        self.global_embed = nn.Parameter(torch.zeros(1, embed_dim, 6))
+        self.view_embed = nn.Parameter(torch.zeros(1, embed_dim, 6, 1))
 
         if self.end2end:
             self.query_pos_embed = nn.Parameter(torch.zeros(1, embed_dim, 4))
@@ -820,10 +837,13 @@ class Interfuser(nn.Module):
 
         self.position_encoding = PositionEmbeddingSine(embed_dim // 2, normalize=True)
 
-        encoder_layer = TransformerEncoderLayer(
-            embed_dim, num_heads, dim_feedforward, dropout, act_layer, normalize_before
-        )
-        self.encoder = TransformerEncoder(encoder_layer, enc_depth, None)
+        if transformer_encoder == 'dual':
+            self.encoder = DAEFormer(in_dim=embed_dim, layers_count = enc_depth)
+        else:
+            encoder_layer = TransformerEncoderLayer(
+                embed_dim, num_heads, dim_feedforward, dropout, act_layer, normalize_before
+            )
+            self.encoder = TransformerEncoder(encoder_layer, enc_depth, None)
 
         decoder_layer = TransformerDecoderLayer(
             embed_dim, num_heads, dim_feedforward, dropout, act_layer, normalize_before
@@ -848,11 +868,13 @@ class Interfuser(nn.Module):
         front_center_image,
         lidar,
         measurements,
+        bov_image,
     ):
         features = []
 
         # Front view processing
         front_image_token, front_image_token_global = self.rgb_patch_embed(front_image)
+        # print(f'front_image_token >> {front_image_token.size()}, front_image_token_global>> {front_image_token_global.size()}')
         if self.use_view_embed:
             front_image_token = (
                 front_image_token
@@ -864,6 +886,8 @@ class Interfuser(nn.Module):
                 front_image_token
             )
         front_image_token = front_image_token.flatten(2).permute(2, 0, 1)
+        # print(f'front_image_token shape is >>{front_image_token.size()}')
+        
         front_image_token_global = (
             front_image_token_global
             + self.view_embed[:, :, 0, :]
@@ -871,6 +895,30 @@ class Interfuser(nn.Module):
         )
         front_image_token_global = front_image_token_global.permute(2, 0, 1)
         features.extend([front_image_token, front_image_token_global])
+
+        # BOV view processing
+        bov_image_token, bov_image_token_global = self.rgb_patch_embed(bov_image)
+        # print(f'front_image_token >> {front_image_token.size()}, front_image_token_global>> {front_image_token_global.size()}')
+        if self.use_view_embed:
+            bov_image_token = (
+                bov_image_token
+                + self.view_embed[:, :, 5:6, :]
+                + self.position_encoding(bov_image_token)
+            )
+        else:
+            bov_image_token = bov_image_token + self.position_encoding(
+                bov_image_token
+            )
+        bov_image_token = bov_image_token.flatten(2).permute(2, 0, 1)
+        # print(f'front_image_token shape is >>{bov_image_token.size()}')
+        
+        bov_image_token_global = (
+            bov_image_token_global
+            + self.view_embed[:, :, 5, :]
+            + self.global_embed[:, :, 5:6]
+        )
+        bov_image_token_global = bov_image_token_global.permute(2, 0, 1)
+        features.extend([bov_image_token, bov_image_token_global])
 
         if self.with_right_left_sensors:
             # Left view processing
@@ -923,7 +971,9 @@ class Interfuser(nn.Module):
                     right_image_token_global,
                 ]
             )
-
+        # print(f'left_image_token shape is >>{left_image_token.size()}')
+        # print(f'right_image_token shape is >>{right_image_token.size()}')
+        
         if self.with_center_sensor:
             # Front center view processing
             (
@@ -984,7 +1034,18 @@ class Interfuser(nn.Module):
         front_center_image = x["rgb_center"]
         measurements = x["measurements"]
         target_point = x["target_point"]
-        lidar = x["lidar"]
+
+
+        ## Fix the issue if lidar inforamtion is not available 
+        if self.with_lidar:
+          lidar = x["lidar"]
+        else:
+          lidar = None
+
+        if self.with_bov:
+            bov_image = x["bov"]            
+        else:
+            bov_image = None
 
         if self.direct_concat:
             img_size = front_image.shape[-1]
@@ -997,8 +1058,11 @@ class Interfuser(nn.Module):
             front_center_image = torch.nn.functional.interpolate(
                 front_center_image, size=(img_size, img_size)
             )
+            bov_image = torch.nn.functional.interpolate(
+                bov_image, size=(img_size, img_size)
+            )
             front_image = torch.cat(
-                [front_image, left_image, right_image, front_center_image], dim=1
+                [front_image, left_image, right_image, front_center_image, bov_image], dim=1
             )
         features = self.forward_features(
             front_image,
@@ -1007,8 +1071,10 @@ class Interfuser(nn.Module):
             front_center_image,
             lidar,
             measurements,
+            bov_image,
         )
 
+        # print(f'Whole feature size is >> {features.size()}')
         bs = front_image.shape[0]
 
         if self.end2end:
@@ -1018,11 +1084,15 @@ class Interfuser(nn.Module):
                 torch.ones((bs, 1, 20, 20), device=x["rgb"].device)
             )
             tgt = tgt.flatten(2)
+            # print(tgt.size())
             tgt = torch.cat([tgt, self.query_pos_embed.repeat(bs, 1, 1)], 2)
         tgt = tgt.permute(2, 0, 1)
-
+        # print(f'tgt shape is: {tgt.size()}, self.query_pos_embed >> {self.query_pos_embed.size()}')
         memory = self.encoder(features, mask=self.attn_mask)
+        # print(f' output of the Transformer encoder has shape: {memory.size()}')
+        
         hs = self.decoder(self.query_embed.repeat(1, bs, 1), memory, query_pos=tgt)[0]
+        # print(f'hs shape is:{hs.size()}')
 
         hs = hs.permute(1, 0, 2)  # Batchsize ,  N, C
         if self.end2end:
@@ -1059,6 +1129,7 @@ class Interfuser(nn.Module):
 
         velocity = measurements[:, 6:7].unsqueeze(-1)
         velocity = velocity.repeat(1, 400, 32)
+        # print(f'velocity shape is : {velocity.size()} and traffic_feature shape is {traffic_feature.size()}')
         traffic_feature_with_vel = torch.cat([traffic_feature, velocity], dim=2)
         traffic = self.traffic_pred_head(traffic_feature_with_vel)
         return traffic, waypoints, is_junction, traffic_light_state, stop_sign, traffic_feature
@@ -1074,5 +1145,6 @@ def interfuser_baseline(**kwargs):
         lidar_backbone_name="r18",
         waypoints_pred_head="gru",
         use_different_backbone=True,
+        transformer_encoder = 'simple'
     )
     return model
