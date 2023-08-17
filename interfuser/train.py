@@ -23,8 +23,10 @@ from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
 from render import render, render_waypoints
-
+os.environ["MASTER_ADDR"] = "localhost"
+os.environ["MASTER_PORT"] = "29500"
 import torch
+
 import torch.nn as nn
 import torchvision.utils
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
@@ -115,6 +117,14 @@ parser.add_argument(
     help="dataset validation towns (default: [1])",
 )
 parser.add_argument(
+    "--transformer-encoder",
+    type=str,
+    default='simple',
+    help="Transformer encoder model",
+    choices=['simple', 'dual'],
+)
+
+parser.add_argument(
     "--train-weathers",
     type=int,
     nargs="+",
@@ -139,6 +149,13 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="load lidar data in the dataset",
+)
+
+parser.add_argument(
+    "--with-bov",
+    action="store_true",
+    default=True,
+    help="load BOV data in the dataset",
 )
 parser.add_argument(
     "--with-seg",
@@ -751,7 +768,7 @@ parser.add_argument(
     metavar="N",
     help="Test/inference time augmentation (oversampling) factor. 0=None (default: 0)",
 )
-parser.add_argument("--local_rank", default=0, type=int)
+parser.add_argument("--local_rank", default=int(os.environ["LOCAL_RANK"]), type=int)
 parser.add_argument(
     "--use-multi-epochs-loader",
     action="store_true",
@@ -792,8 +809,8 @@ class WaypointL1Loss:
         invaild_mask = target.ge(1000)
         output[invaild_mask] = 0
         target[invaild_mask] = 0
-        loss = self.loss(output, target)  # shape: n, 12, 2
-        loss = torch.mean(loss, (0, 2))  # shape: 12
+        loss = self.loss(output, target)  # shape: n, 10 2
+        loss = torch.mean(loss, (0, 2))  # shape: 10
         loss = loss * torch.tensor(self.weights, device=output.device)
         return torch.mean(loss)
 
@@ -811,11 +828,11 @@ class MVTL1Loss:
         target_prob_0 = torch.masked_select(target[:, :, 0], target_0_mask)
         output_prob_0 = torch.masked_select(output[:, :, 0], target_0_mask)
         if target_prob_1.numel() == 0:
-            loss_prob_1 = 0
+            loss_prob_1 = torch.tensor(0.0)
         else:
             loss_prob_1 = self.loss(output_prob_1, target_prob_1)
         if target_prob_0.numel() == 0:
-            loss_prob_0 = 0
+            loss_prob_0 = torch.tensor(0.0)
         else:
             loss_prob_0 = self.loss(output_prob_0, target_prob_0)
         loss_1 = 0.5 * loss_prob_0 + 0.5 * loss_prob_1
@@ -823,7 +840,7 @@ class MVTL1Loss:
         output_1 = output[target_1_mask][:][:, 1:6]
         target_1 = target[target_1_mask][:][:, 1:6]
         if target_1.numel() == 0:
-            loss_2 = 0
+            loss_2 = torch.tensor(0.0)
         else:
             loss_2 = self.loss(target_1, output_1)
 
@@ -831,7 +848,7 @@ class MVTL1Loss:
         output_2 = output[target_1_mask][:][:, 6]
         target_2 = target[target_1_mask][:][:, 6]
         if target_2.numel() == 0:
-            loss_3 = 0
+            loss_3 = torch.tensor(0.0)
         else:
             loss_3 = self.loss(target_2, output_2)
         return 0.5 * loss_1 * self.weight + 0.5 * loss_2, loss_3
@@ -921,6 +938,7 @@ def main():
         scriptable=args.torchscript,
         checkpoint_path=args.initial_checkpoint,
         freeze_num=args.freeze_num,
+        transformer_encoder = args.transformer_encoder,
     )
 
     if args.local_rank == 0:
@@ -966,10 +984,15 @@ def main():
         assert not use_amp == "apex", "Cannot use APEX AMP with torchscripted model"
         assert not args.sync_bn, "Cannot use SyncBatchNorm with torchscripted model"
         model = torch.jit.script(model)
-
-    linear_scaled_lr = (
-        args.lr * args.batch_size * torch.distributed.get_world_size() / 512.0
-    )
+    
+    if args.distributed:
+      linear_scaled_lr = (
+          args.lr * args.batch_size * torch.distributed.get_world_size() / 512.0
+      )
+    else:
+      linear_scaled_lr = (
+          args.lr * args.batch_size / 512.0  
+      )  
     args.lr = linear_scaled_lr
     if args.with_backbone_lr:
         if args.local_rank == 0:
@@ -979,7 +1002,7 @@ def main():
         backbone_linear_scaled_lr = (
             args.backbone_lr
             * args.batch_size
-            * torch.distributed.get_world_size()
+            * 1 # torch.distributed.get_wordsize() is set to 1 as we are using only one gpu
             / 512.0
         )
         backbone_weights = []
@@ -1083,6 +1106,7 @@ def main():
             batch_size=args.batch_size,
             with_lidar=args.with_lidar,
             with_seg=args.with_seg,
+            with_bov=args.with_bov,
             with_depth=args.with_depth,
             multi_view=args.multi_view,
             augment_prob=args.augment_prob
@@ -1095,6 +1119,7 @@ def main():
             batch_size=args.batch_size,
             with_lidar=args.with_lidar,
             with_seg=args.with_seg,
+            with_bov=args.with_bov,
             with_depth=args.with_depth,
             multi_view=args.multi_view,
             augment_prob=args.augment_prob
@@ -1202,7 +1227,8 @@ def main():
                     str(data_config["input_size"][-1]),
                 ]
             )
-        output_dir = get_outdir(args.output if args.output else "./output", exp_name)
+        # output_dir = get_outdir(args.output if args.output else "./output", exp_name)
+        output_dir = get_outdir(args.output if args.output else "./output/"+args.transformer_encoder)
         writer = SummaryWriter(logdir=output_dir)
         decreasing = args.saver_decreasing
         saver = CheckpointSaver(
@@ -1360,9 +1386,19 @@ def train_one_epoch(
                     target[key] = target[key].cuda()
             else:
                 target = target.cuda()
-
+        # print('Inputs for the network are >>>>>>>> ')
+        # for key in input.keys():
+        #     print (f'{key} has shape {input[key].size()}')
+        # print('GTs for the data are >>>>>>>> ')
+        # for item in target:
+        #     print(item.size())
+        
         with amp_autocast():
             output = model(input)
+            # print('>>>>>>>>> Network output section >>>>>')
+            # for out in output:
+            #     print(f'Output of the network has shape: {out.size()}')
+            
             loss_traffic, loss_velocity = loss_fns["traffic"](output[0], target[4])
             loss_waypoints = loss_fns["waypoints"](output[1], target[1])
             loss_junction = loss_fns["cls"](output[2], target[2])
@@ -1702,23 +1738,37 @@ def validate(
                 reduced_loss = loss.data
 
             torch.cuda.synchronize()
+            if args.distributed:
+              losses_m.update(reduced_loss.item(), batch_size)
+              losses_traffic.update(reduced_loss_traffic.item(), batch_size)
+              losses_velocity.update(reduced_loss_velocity.item(), batch_size)
+              losses_waypoints.update(reduced_loss_waypoints.item(), batch_size)
+              losses_junction.update(reduced_loss_junction.item(), batch_size)
+              losses_traffic_light_state.update(
+                  reduced_loss_traffic_light_state.item(), batch_size
+              )
+              losses_stop_sign.update(reduced_loss_stop_sign.item(), batch_size)
+  
+              l1_errorm.update(reduced_loss.item(), batch_size)
+              junction_errorm.update(reduced_junction_error.item(), batch_size)
+              traffic_light_state_errorm.update(
+                  reduced_traffic_light_state_error.item(), batch_size
+              )
+              stop_sign_errorm.update(reduced_stop_sign_error.item(), batch_size)
 
-            losses_m.update(reduced_loss.item(), batch_size)
-            losses_traffic.update(reduced_loss_traffic.item(), batch_size)
-            losses_velocity.update(reduced_loss_velocity.item(), batch_size)
-            losses_waypoints.update(reduced_loss_waypoints.item(), batch_size)
-            losses_junction.update(reduced_loss_junction.item(), batch_size)
-            losses_traffic_light_state.update(
-                reduced_loss_traffic_light_state.item(), batch_size
-            )
-            losses_stop_sign.update(reduced_loss_stop_sign.item(), batch_size)
-
-            l1_errorm.update(reduced_loss.item(), batch_size)
-            junction_errorm.update(reduced_junction_error.item(), batch_size)
-            traffic_light_state_errorm.update(
-                reduced_traffic_light_state_error.item(), batch_size
-            )
-            stop_sign_errorm.update(reduced_stop_sign_error.item(), batch_size)
+            else:
+              losses_m.update(loss.item(), batch_size)
+              losses_traffic.update(loss_traffic.item(), batch_size)
+              losses_velocity.update(loss_velocity, batch_size)
+              losses_waypoints.update(loss_waypoints.item(), batch_size)
+              losses_junction.update(loss_junction.item(), batch_size)
+              losses_traffic_light_state.update(loss_traffic_light_state.item(), batch_size)
+              losses_stop_sign.update(loss_stop_sign.item(), batch_size)
+  
+              l1_errorm.update(loss.item(), batch_size)
+              junction_errorm.update(junction_error.item(), batch_size)
+              traffic_light_state_errorm.update(traffic_light_state_error.item(), batch_size)
+              stop_sign_errorm.update(stop_sign_error.item(), batch_size)            
 
             batch_time_m.update(time.time() - end)
             end = time.time()
