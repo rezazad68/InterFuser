@@ -46,6 +46,16 @@ def create_carla_loader(
         std=std,
     )
 
+    dataset.bov_transform = create_carla_rgb_transform(
+        input_size,
+        is_training=is_training,
+        scale=scale,
+        color_jitter=0,
+        interpolation=interpolation,
+        mean=mean,
+        std=std,
+    )
+
     dataset.rgb_center_transform = create_carla_rgb_transform(
         128,
         is_training=is_training,
