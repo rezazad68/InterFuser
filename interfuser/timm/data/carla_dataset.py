@@ -86,10 +86,12 @@ class CarlaMVDetDataset(BaseIODataset):
         depth_transform=None,
         seg_transform=None,
         lidar_transform=None,
+        bov_transform=None,
         multi_view_transform=None,
         with_waypoints=False,
         with_seg=False,
         with_depth=False,
+        with_bov=False,
         with_lidar=False,
         multi_view=False,
         augment_prob=0.0,
@@ -100,6 +102,7 @@ class CarlaMVDetDataset(BaseIODataset):
         self.input_lidar_size = input_lidar_size
         self.input_rgb_size = input_rgb_size
         self.rgb_transform = rgb_transform
+        self.bov_transform = bov_transform
         self.seg_transform = seg_transform
         self.depth_transform = depth_transform
         self.lidar_transform = lidar_transform
@@ -109,6 +112,7 @@ class CarlaMVDetDataset(BaseIODataset):
 
         self.with_seg = with_seg
         self.with_depth = with_depth
+        self.with_bov   = with_bov
         self.with_lidar = with_lidar
         self.multi_view = multi_view
 
@@ -159,6 +163,9 @@ class CarlaMVDetDataset(BaseIODataset):
         rgb_image = self._load_image(
             os.path.join(route_dir, "rgb_front", "%04d.jpg" % frame_id)
         )
+        rgb_bov = self._load_image(
+            os.path.join(route_dir, "birdview", "%04d.jpg" % frame_id)
+        )
         rgb_left_image = self._load_image(
             os.path.join(route_dir, "rgb_left", "%04d.jpg" % frame_id)
         )
@@ -168,6 +175,7 @@ class CarlaMVDetDataset(BaseIODataset):
 
         if self.augment_prob > 0:
            rgb_image = Image.fromarray(self.augmenter(image=np.array(rgb_image)))
+           rgb_bov   = Image.fromarray(self.augmenter(image=np.array(rgb_bov)))
            rgb_left_image = Image.fromarray(self.augmenter(image=np.array(rgb_left_image)))
            rgb_right_image = Image.fromarray(self.augmenter(image=np.array(rgb_right_image)))
 
@@ -215,8 +223,8 @@ class CarlaMVDetDataset(BaseIODataset):
         actors_data = self._load_json(
             os.path.join(route_dir, "actors_data", "%04d.json" % frame_id)
         )
-        affordances = self._load_npy(os.path.join(route_dir, 'affordances/%04d.npy' % frame_id))
-        stop_sign = int(affordances.item()['stop_sign'])
+        #affordances = self._load_npy(os.path.join(route_dir, 'affordances/%04d.npy' % frame_id))
+        stop_sign   = 0 #int(affordances.item()['stop_sign'])
 
         if measurements["is_junction"] is True:
             is_junction = 1
@@ -300,7 +308,9 @@ class CarlaMVDetDataset(BaseIODataset):
 
         if self.rgb_transform is not None:
             rgb_main_image = self.rgb_transform(rgb_image)
+            rgb_bov = self.rgb_transform(rgb_bov)
         data["rgb"] = rgb_main_image
+        data["bov"] = rgb_bov
 
         if self.rgb_center_transform is not None:
             rgb_center_image = self.rgb_center_transform(rgb_image)
